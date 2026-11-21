@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.stresstest'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.example.stresstest"
+        minSdk 22          // Android 5.1.1 (and newer)
+        targetSdk 33       // Android 13
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+// No external libraries: the app uses only the plain Android framework.
+dependencies {
+}
