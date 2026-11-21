@@ -8,90 +8,221 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Reads CPU/GPU temperatures from /sys/class/thermal. Which sensors exist
- * (and whether apps may read them) depends on the phone and Android version,
- * so everything here is "best effort" and returns NaN when unavailable.
+ * Reads CPU/GPU temperatures from the kernel files that Android phones expose
+ * (thermal zones, hwmon, and some vendor-specific files). Which files exist, and
+ * whether normal apps may read them, depends on the phone and Android version.
+ * Everything is "best effort" and returns NaN when nothing is readable.
  */
 public class TempReader {
 
-    private static class Zone {
-        String type;
+    private static class Src {
+        String name;
         File file;
         boolean cpu;
         boolean gpu;
     }
 
-    private final List<Zone> zones = new ArrayList<>();
+    private final List<Src> srcs = new ArrayList<Src>();   // clearly CPU or GPU
+    private final List<Src> other = new ArrayList<Src>();  // readable, but unknown purpose
+    private int found;
+    private int blocked;
+    private volatile boolean cpuApprox;
 
     public TempReader() {
         discover();
     }
 
+    // ------------------------------------------------------------ classification
+
+    public static boolean isGpuName(String name) {
+        String t = name.toLowerCase(Locale.US);
+        return t.contains("gpu") || t.contains("g3d") || t.contains("mali")
+                || t.contains("adreno") || t.contains("kgsl");
+    }
+
+    public static boolean isCpuName(String name) {
+        if (isGpuName(name)) return false;
+        String t = name.toLowerCase(Locale.US);
+        if (t.contains("batt") || t.contains("chg") || t.contains("charg")) return false;
+        return t.contains("cpu") || t.contains("soc") || t.contains("big") || t.contains("little")
+                || t.contains("cluster") || t.contains("kryo") || t.contains("apc")
+                || t.contains("tmu") || t.contains("tsens_tz_sensor");
+    }
+
+    /** Turns raw text (milli-degrees, tenths or degrees) into degrees C, or NaN. */
+    public static double normalize(String s) {
+        if (s == null) return Double.NaN;
+        double raw;
+        try {
+            raw = Double.parseDouble(s.trim().split("[,\\s]+")[0]);
+        } catch (Exception e) {
+            return Double.NaN;
+        }
+        double a = Math.abs(raw);
+        double v = a >= 1000 ? raw / 1000.0 : (a >= 150 ? raw / 10.0 : raw);
+        if (v <= 1.0 || v >= 150.0) return Double.NaN;
+        return v;
+    }
+
+    // ------------------------------------------------------------------ discovery
+
     private void discover() {
+        // 1) Thermal zones (try both common locations).
+        String[] roots = {"/sys/class/thermal", "/sys/devices/virtual/thermal"};
         for (int i = 0; i < 100; i++) {
-            File dir = new File("/sys/class/thermal/thermal_zone" + i);
-            File tempFile = new File(dir, "temp");
-            if (!tempFile.exists()) continue;
-            if (readLine(tempFile) == null) continue; // not readable by apps
+            for (String root : roots) {
+                File dir = new File(root, "thermal_zone" + i);
+                File tf = new File(dir, "temp");
+                if (readLine(tf) == null) {
+                    if (tf.exists()) {
+                        found++;
+                        blocked++;
+                    }
+                    continue;
+                }
+                found++;
+                String type = readLine(new File(dir, "type"));
+                add(type == null ? "zone" + i : type.trim(), tf);
+                break;
+            }
+        }
 
-            String type = readLine(new File(dir, "type"));
-            if (type == null) type = "zone" + i;
-            String t = type.toLowerCase(Locale.US);
+        // 2) hwmon sensors.
+        for (int h = 0; h < 10; h++) {
+            File d = new File("/sys/class/hwmon/hwmon" + h);
+            String name = readLine(new File(d, "name"));
+            for (int k = 1; k <= 4; k++) {
+                File tf = new File(d, "temp" + k + "_input");
+                if (readLine(tf) == null) {
+                    if (tf.exists()) {
+                        found++;
+                        blocked++;
+                    }
+                    continue;
+                }
+                found++;
+                add((name == null ? "hwmon" + h : name.trim()) + "/temp" + k, tf);
+            }
+        }
 
-            Zone z = new Zone();
-            z.type = type;
-            z.file = tempFile;
-            z.gpu = t.contains("gpu") || t.contains("g3d") || t.contains("mali") || t.contains("adreno");
-            z.cpu = !z.gpu && (t.contains("cpu") || t.contains("soc") || t.contains("big")
-                    || t.contains("little") || t.contains("cluster") || t.contains("kryo")
-                    || t.contains("apc") || t.contains("tsens_tz_sensor"));
-            if (t.contains("batt") || t.contains("chg") || t.contains("charg")) z.cpu = false;
-            if (z.cpu || z.gpu) zones.add(z);
+        // 3) Vendor-specific files (Exynos, MediaTek, Adreno, old kernels).
+        String[][] extras = {
+                {"cpu_temp", "/sys/devices/system/cpu/cpu0/cpufreq/cpu_temp"},
+                {"cpu_temp_alt", "/sys/devices/system/cpu/cpu0/cpufreq/FakeShmoo_cpu_temp"},
+                {"tmu", "/sys/devices/10060000.tmu/temp"},
+                {"tmu", "/sys/devices/platform/10060000.tmu/temp"},
+                {"cpu_mtk", "/proc/mtktz/mtktscpu"},
+                {"cpu_mtk_ap", "/proc/mtktz/mtktsAP"},
+                {"gpu_kgsl", "/sys/class/kgsl/kgsl-3d0/temp"},
+        };
+        for (String[] e : extras) {
+            File f = new File(e[1]);
+            if (readLine(f) == null) {
+                if (f.exists()) {
+                    found++;
+                    blocked++;
+                }
+                continue;
+            }
+            found++;
+            add(e[0], f);
         }
     }
 
-    /** Hottest CPU-related sensor in °C, or NaN. */
-    public double readCpu() {
-        return readMax(false);
+    private void add(String name, File file) {
+        Src s = new Src();
+        s.name = name;
+        s.file = file;
+        s.gpu = isGpuName(name);
+        s.cpu = isCpuName(name);
+        if (s.cpu || s.gpu) srcs.add(s);
+        else other.add(s);
     }
 
-    /** Hottest GPU-related sensor in °C, or NaN. */
+    // -------------------------------------------------------------------- reading
+
+    /** Hottest CPU sensor in C. If none is clearly a CPU sensor, uses another sensor (approximate). */
+    public double readCpu() {
+        double v = readMax(false);
+        cpuApprox = false;
+        if (Double.isNaN(v)) {
+            v = readMaxOther();
+            if (!Double.isNaN(v)) cpuApprox = true;
+        }
+        return v;
+    }
+
     public double readGpu() {
         return readMax(true);
     }
 
+    /** True when the last CPU value came from a sensor that is only probably the CPU. */
+    public boolean isCpuApprox() {
+        return cpuApprox;
+    }
+
     private double readMax(boolean gpu) {
         double best = Double.NaN;
-        for (Zone z : zones) {
-            if (gpu ? !z.gpu : !z.cpu) continue;
-            double v = parse(readLine(z.file));
+        for (Src s : srcs) {
+            if (gpu ? !s.gpu : !s.cpu) continue;
+            double v = normalize(readLine(s.file));
             if (Double.isNaN(v)) continue;
             if (Double.isNaN(best) || v > best) best = v;
         }
         return best;
     }
 
-    /** Short text about which sensors were found. */
+    private double readMaxOther() {
+        double best = Double.NaN;
+        for (Src s : other) {
+            String t = s.name.toLowerCase(Locale.US);
+            if (t.contains("batt") || t.contains("chg") || t.contains("charg") || t.contains("usb")
+                    || t.contains("pm") || t.contains("bms") || t.contains("ambient")) continue;
+            double v = normalize(readLine(s.file));
+            if (Double.isNaN(v)) continue;
+            if (Double.isNaN(best) || v > best) best = v;
+        }
+        return best;
+    }
+
+    /** Human readable report: what was found, what is blocked, and live values. */
     public String describe() {
         int c = 0, g = 0;
-        StringBuilder cn = new StringBuilder();
-        StringBuilder gn = new StringBuilder();
-        for (Zone z : zones) {
-            if (z.gpu) {
-                if (g++ < 2) gn.append(g > 1 ? ", " : "").append(z.type);
-            } else {
-                if (c++ < 2) cn.append(c > 1 ? ", " : "").append(z.type);
-            }
+        for (Src s : srcs) {
+            if (s.gpu) g++;
+            else c++;
         }
         StringBuilder sb = new StringBuilder();
-        sb.append("CPU sensors: ").append(c == 0 ? "none readable" : c + " (" + cn + (c > 2 ? ", ..." : "") + ")");
-        sb.append("\nGPU sensors: ").append(g == 0 ? "none readable" : g + " (" + gn + (g > 2 ? ", ..." : "") + ")");
-        sb.append("\nBattery sensor: always available");
-        if (c == 0 || g == 0) {
-            sb.append("\nNote: many phones (especially Android 10+) block apps from reading CPU/GPU sensors.");
+        sb.append("SENSOR REPORT\n");
+        sb.append("Thermal files found: ").append(found)
+                .append(", blocked by Android: ").append(blocked).append('\n');
+        sb.append("CPU sensors: ").append(c).append("  GPU sensors: ").append(g)
+                .append("  other: ").append(other.size()).append('\n');
+        int shown = 0;
+        for (Src s : srcs) {
+            if (shown++ >= 14) break;
+            sb.append("  ").append(s.gpu ? "[GPU] " : "[CPU] ").append(s.name).append(" = ")
+                    .append(valueText(s)).append('\n');
+        }
+        for (Src s : other) {
+            if (shown++ >= 14) break;
+            sb.append("  [?] ").append(s.name).append(" = ").append(valueText(s)).append('\n');
+        }
+        if (srcs.isEmpty() && other.isEmpty()) {
+            sb.append("Android blocks apps from reading CPU/GPU sensors on this phone.\n");
+            sb.append("(Normal on Android 10+.) Tick the root option if the phone is rooted.\n");
+        } else if (c == 0 && !other.isEmpty()) {
+            sb.append("No sensor is clearly named CPU - an approximate one is used (shown with ~).\n");
         }
         return sb.toString();
     }
+
+    private String valueText(Src s) {
+        double v = normalize(readLine(s.file));
+        return Double.isNaN(v) ? "n/a" : String.format(Locale.US, "%.1f", v);
+    }
+
+    // ---------------------------------------------------------------- CPU clocks
 
     /**
      * Highest current CPU clock and highest possible clock in MHz, or null
@@ -118,21 +249,6 @@ public class TempReader {
         } catch (NumberFormatException e) {
             return -1;
         }
-    }
-
-    /** Converts raw sysfs numbers (milli-degrees, tenths or degrees) to °C. */
-    private static double parse(String s) {
-        if (s == null) return Double.NaN;
-        double raw;
-        try {
-            raw = Double.parseDouble(s.trim());
-        } catch (NumberFormatException e) {
-            return Double.NaN;
-        }
-        double a = Math.abs(raw);
-        double v = a >= 1000 ? raw / 1000.0 : (a >= 150 ? raw / 10.0 : raw);
-        if (v <= 1.0 || v >= 150.0) return Double.NaN;
-        return v;
     }
 
     private static String readLine(File f) {

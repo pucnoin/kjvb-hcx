@@ -10,8 +10,8 @@ android {
         applicationId "com.example.stresstest"
         minSdk 22          // Android 5.1.1 (and newer)
         targetSdk 33       // Android 13
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "1.1"
     }
 
     buildTypes {

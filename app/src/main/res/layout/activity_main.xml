@@ -129,6 +129,15 @@
                 android:textColor="#C5D1DB"
                 android:textSize="13sp" />
 
+            <CheckBox
+                android:id="@+id/cbRoot"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:buttonTint="#69F0AE"
+                android:text="Use root to read CPU/GPU sensors (rooted phones only)"
+                android:textColor="#C5D1DB"
+                android:textSize="13sp" />
+
             <Button
                 android:id="@+id/btnStart"
                 android:layout_width="match_parent"

@@ -43,12 +43,13 @@ public class MainActivity extends Activity {
     private final GpuStressRenderer renderer = new GpuStressRenderer();
     private final ThrottleDetector cpuDet = new ThrottleDetector();
     private final ThrottleDetector gpuDet = new ThrottleDetector();
+    private final RootThermal root = new RootThermal();
     private TempReader temps;
 
     private GLSurfaceView glView;
     private ChartView chart;
     private RadioGroup rgTarget, rgIntensity;
-    private CheckBox cbSafety;
+    private CheckBox cbSafety, cbRoot;
     private Button btnStart;
     private TextView tvTime, tvThrottle, tvCpuTemp, tvGpuTemp, tvBatTemp, tvStats, tvInfo, tvSensors;
 
@@ -57,7 +58,8 @@ public class MainActivity extends Activity {
     private long lastBlocks;
     private boolean curCpu, curGpu;
     private int curThreads;
-    private String stopReason;
+    private int tickCount;
+    private final float[] peak = {Float.NaN, Float.NaN, Float.NaN};
 
     private final Runnable ticker = new Runnable() {
         @Override
@@ -75,6 +77,7 @@ public class MainActivity extends Activity {
         rgTarget = (RadioGroup) findViewById(R.id.rgTarget);
         rgIntensity = (RadioGroup) findViewById(R.id.rgIntensity);
         cbSafety = (CheckBox) findViewById(R.id.cbSafety);
+        cbRoot = (CheckBox) findViewById(R.id.cbRoot);
         btnStart = (Button) findViewById(R.id.btnStart);
         tvTime = (TextView) findViewById(R.id.tvTime);
         tvThrottle = (TextView) findViewById(R.id.tvThrottle);
@@ -92,7 +95,6 @@ public class MainActivity extends Activity {
         glView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
 
         temps = new TempReader();
-        tvSensors.setText(temps.describe());
 
         btnStart.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -102,6 +104,14 @@ public class MainActivity extends Activity {
                 } else {
                     startTest();
                 }
+            }
+        });
+
+        cbRoot.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (cbRoot.isChecked()) root.start();
+                else root.stop();
             }
         });
 
@@ -119,6 +129,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         glView.onResume();
+        if (cbRoot.isChecked()) root.start();
         handler.post(ticker);
     }
 
@@ -129,6 +140,7 @@ public class MainActivity extends Activity {
             stopTest("Stopped because the app went to the background.");
         }
         handler.removeCallbacks(ticker);
+        root.stop();
         glView.onPause();
         super.onPause();
     }
@@ -145,8 +157,8 @@ public class MainActivity extends Activity {
 
     private void startTest() {
         running = true;
-        stopReason = null;
         startMs = SystemClock.elapsedRealtime();
+        for (int i = 0; i < peak.length; i++) peak[i] = Float.NaN;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         btnStart.setText("STOP STRESS TEST");
         applyLoad();
@@ -182,7 +194,6 @@ public class MainActivity extends Activity {
 
     private void stopTest(String reason) {
         running = false;
-        stopReason = reason;
         cpuStress.stop();
         renderer.active = false;
         glView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
@@ -202,20 +213,41 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------ sampling
 
     private void tick() {
+        tickCount++;
+        Intent bi = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        float batT = batteryTemp(bi);
+
         float cpuT = (float) temps.readCpu();
+        boolean approx = temps.isCpuApprox();
         float gpuT = (float) temps.readGpu();
-        float batT = readBatteryTemp();
+        if (cbRoot.isChecked()) {
+            double rc = root.cpu;
+            double rg = root.gpu;
+            if (!Double.isNaN(rc)) {
+                cpuT = (float) rc;
+                approx = false;
+            }
+            if (!Double.isNaN(rg)) gpuT = (float) rg;
+        }
 
         chart.push(cpuT, gpuT, batT);
-        tvCpuTemp.setText(fmt(cpuT));
+        tvCpuTemp.setText((approx && !Float.isNaN(cpuT) ? "~" : "") + fmt(cpuT));
         tvGpuTemp.setText(fmt(gpuT));
         tvBatTemp.setText(fmt(batT));
+
+        float[] now = {cpuT, gpuT, batT};
+        if (running) {
+            for (int i = 0; i < 3; i++) {
+                if (!Float.isNaN(now[i]) && (Float.isNaN(peak[i]) || now[i] > peak[i])) peak[i] = now[i];
+            }
+        }
         updateStats();
 
         StringBuilder info = new StringBuilder();
+        long elapsed = 0;
 
         if (running) {
-            long elapsed = (SystemClock.elapsedRealtime() - startMs) / 1000;
+            elapsed = (SystemClock.elapsedRealtime() - startMs) / 1000;
             tvTime.setText(String.format(Locale.US, "%02d:%02d:%02d",
                     elapsed / 3600, (elapsed / 60) % 60, elapsed % 60));
 
@@ -247,26 +279,35 @@ public class MainActivity extends Activity {
                         renderer.draws, pct(gpuDet)));
                 if (renderer.error != null) info.append(renderer.error).append('\n');
             }
-            updateThrottleText(elapsed);
-        } else if (stopReason == null) {
-            // idle: monitor only
         }
+
+        float headroom = thermalHeadroom();
+        int thermal = thermalStatus();
+        if (running) updateThrottleText(elapsed, thermal, headroom);
 
         double[] f = TempReader.readCpuFreqMhz();
         if (f != null) {
             info.append(String.format(Locale.US, "CPU clock: %.2f / %.2f GHz\n", f[0] / 1000.0, f[1] / 1000.0));
         }
-        int thermal = thermalStatus();
         if (thermal >= 0) {
             info.append("System thermal status: ").append(THERMAL_NAMES[Math.min(thermal, 6)]).append('\n');
         } else {
-            info.append("System thermal status: not available on this Android version\n");
+            info.append("System thermal status: needs Android 10+\n");
         }
+        if (!Float.isNaN(headroom)) {
+            info.append(String.format(Locale.US, "Thermal headroom: %.2f (1.00 = throttle limit)\n", headroom));
+        } else {
+            info.append("Thermal headroom: needs Android 11+\n");
+        }
+        info.append(batteryInfo(bi)).append('\n');
         tvInfo.setText(info.toString());
+
+        if (tickCount % 5 == 1) {
+            tvSensors.setText(temps.describe() + "Root: " + root.status);
+        }
     }
 
-    private void updateThrottleText(long elapsed) {
-        int thermal = thermalStatus();
+    private void updateThrottleText(long elapsed, int thermal, float headroom) {
         StringBuilder why = new StringBuilder();
 
         boolean cpuSlow = curCpu && cpuDet.confident() && cpuDet.percentOfPeak() < THROTTLE_BELOW_PERCENT;
@@ -274,12 +315,15 @@ public class MainActivity extends Activity {
         if (cpuSlow) why.append(String.format(Locale.US, "\nCPU speed down to %.0f%%", cpuDet.percentOfPeak()));
         if (gpuSlow) why.append(String.format(Locale.US, "\nGPU speed down to %.0f%%", gpuDet.percentOfPeak()));
         if (thermal >= 2) why.append("\nSystem thermal status: ").append(THERMAL_NAMES[Math.min(thermal, 6)]);
+        if (!Float.isNaN(headroom) && headroom >= 1.0f) {
+            why.append(String.format(Locale.US, "\nThermal headroom used up (%.2f)", headroom));
+        }
 
         if (why.length() > 0) {
             tvThrottle.setText("⚠ THROTTLING" + why);
             tvThrottle.setTextColor(Color.parseColor("#FF5252"));
-        } else if (thermal == 1) {
-            tvThrottle.setText("Light thermal pressure (no throttling yet)");
+        } else if (thermal == 1 || (!Float.isNaN(headroom) && headroom >= 0.85f)) {
+            tvThrottle.setText("Getting close to throttling");
             tvThrottle.setTextColor(Color.parseColor("#FFD54F"));
         } else if (elapsed < 15) {
             tvThrottle.setText("Measuring baseline speed...");
@@ -295,6 +339,11 @@ public class MainActivity extends Activity {
         sb.append(statLine("CPU    ", chart.stats(0))).append('\n');
         sb.append(statLine("GPU    ", chart.stats(1))).append('\n');
         sb.append(statLine("Battery", chart.stats(2)));
+        if (!Float.isNaN(peak[0]) || !Float.isNaN(peak[1]) || !Float.isNaN(peak[2])) {
+            sb.append("\nPeak since start:  CPU ").append(fmt(peak[0]))
+                    .append("  GPU ").append(fmt(peak[1]))
+                    .append("  Bat ").append(fmt(peak[2]));
+        }
         tvStats.setText(sb.toString());
     }
 
@@ -317,12 +366,26 @@ public class MainActivity extends Activity {
     }
 
     /** Battery temperature has 0.1 degree resolution on Android. */
-    private float readBatteryTemp() {
-        Intent i = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+    private static float batteryTemp(Intent i) {
         if (i == null) return Float.NaN;
         int t = i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
         if (t == Integer.MIN_VALUE) return Float.NaN;
         return t / 10f;
+    }
+
+    private static String batteryInfo(Intent i) {
+        if (i == null) return "Battery: n/a";
+        int level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+        int status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+        int mv = i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1);
+        boolean charging = status == BatteryManager.BATTERY_STATUS_CHARGING
+                || status == BatteryManager.BATTERY_STATUS_FULL;
+        StringBuilder sb = new StringBuilder("Battery: ");
+        if (level >= 0 && scale > 0) sb.append(level * 100 / scale).append("%");
+        sb.append(charging ? ", charging (adds heat)" : ", on battery");
+        if (mv > 0) sb.append(String.format(Locale.US, ", %.2f V", mv / 1000.0));
+        return sb.toString();
     }
 
     /** Android 10+ only. Returns -1 when not supported. */
@@ -332,5 +395,17 @@ public class MainActivity extends Activity {
             if (pm != null) return pm.getCurrentThermalStatus();
         }
         return -1;
+    }
+
+    /** Android 11+ only. 1.0 means the phone starts to throttle. NaN when unavailable. */
+    private float thermalHeadroom() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                if (pm != null) return pm.getThermalHeadroom(0);
+            } catch (Exception ignored) {
+            }
+        }
+        return Float.NaN;
     }
 }
